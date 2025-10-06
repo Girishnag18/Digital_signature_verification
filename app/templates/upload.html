@@ -1,0 +1,148 @@
+{% extends 'layout.html' %}
+{% block title %}Upload Document{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <h2 class="text-center mb-4">Upload Document for Verification</h2>
+        
+        <div class="card">
+            <div class="card-body">
+                <form id="uploadForm" method="POST" enctype="multipart/form-data">
+                    <div class="upload-area mb-3">
+                        <div class="text-center p-4">
+                            <i class="fas fa-cloud-upload-alt fa-3x text-muted mb-3"></i>
+                            <h5>Drop your PDF file here or click to browse</h5>
+                            <p class="text-muted">Only PDF files with digital signatures are supported</p>
+                            <input id="fileInput" type="file" name="document" class="form-control" accept=".pdf" required>
+                        </div>
+                    </div>
+                    <div class="text-center">
+                        <button id="verifyBtn" type="submit" class="btn btn-success btn-lg">
+                            <i class="fas fa-shield-alt me-2"></i>Verify Digital Signature
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        
+        <div id="realtimePanel" class="mt-4" style="display:none;">
+            <h5 class="mb-2">Real-time Verification</h5>
+            <div class="border rounded p-3 bg-light">
+                <div id="streamOutput" style="max-height: 260px; overflow-y: auto; font-family: monospace; white-space: pre-wrap;"></div>
+            </div>
+        </div>
+
+        <div class="mt-4">
+            <h5>How it works:</h5>
+            <ol>
+                <li>Select a PDF file with a digital signature</li>
+                <li>Click "Verify Digital Signature" to upload and analyze</li>
+                <li>Real-time status will appear below during verification</li>
+            </ol>
+        </div>
+    </div>
+</div>
+
+{% block scripts %}
+<script>
+(function() {
+  const form = document.getElementById('uploadForm');
+  const verifyBtn = document.getElementById('verifyBtn');
+  const streamPanel = document.getElementById('realtimePanel');
+  const output = document.getElementById('streamOutput');
+  const fileInput = document.getElementById('fileInput');
+
+  function appendLine(text, cls) {
+    const div = document.createElement('div');
+    if (cls) div.className = cls;
+    div.textContent = text;
+    output.appendChild(div);
+    output.scrollTop = output.scrollHeight;
+  }
+
+  async function startStream(pdfPath) {
+    try {
+      streamPanel.style.display = '';
+      output.innerHTML = '';
+      appendLine('Starting real-time verification...', 'text-info');
+
+      // Use Fetch + ReadableStream to consume SSE manually
+      const resp = await fetch('{{ url_for('main.verify_stream') }}', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pdf_path: pdfPath })
+      });
+      if (!resp.ok) {
+        appendLine('Error starting stream: ' + resp.statusText, 'text-danger');
+        return;
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // SSE frames separated by double newlines
+        let parts = buffer.split('\n\n');
+        buffer = parts.pop();
+        for (const frame of parts) {
+          const line = frame.trim();
+          if (!line.startsWith('data:')) continue;
+          try {
+            const jsonStr = line.slice(5).trim();
+            const evt = JSON.parse(jsonStr);
+            if (evt.type === 'status') appendLine('• ' + evt.message);
+            else if (evt.type === 'warning') appendLine('! ' + evt.message, 'text-warning');
+            else if (evt.type === 'error') appendLine('x ' + evt.message, 'text-danger');
+            else if (evt.type === 'result') {
+              const ok = evt.data && evt.data.ok;
+              appendLine('Result: ' + evt.message + ' (ok=' + ok + ')', ok ? 'text-success' : 'text-danger');
+            } else if (evt.type === 'done') {
+              appendLine('Done.');
+            }
+          } catch (e) {
+            appendLine('Parse error: ' + e, 'text-danger');
+          }
+        }
+      }
+    } catch (e) {
+      appendLine('Stream error: ' + e, 'text-danger');
+    }
+  }
+
+  form.addEventListener('submit', async function(e) {
+    e.preventDefault();
+    if (!fileInput.files.length) return;
+
+    verifyBtn.disabled = true;
+    try {
+      // 1) Upload the file via AJAX to get the exact saved path
+      const formData = new FormData(form);
+      const uploadResp = await fetch('{{ url_for('main.upload_ajax') }}', { method: 'POST', body: formData });
+      if (!uploadResp.ok) {
+        const txt = await uploadResp.text();
+        appendLine('Upload failed: ' + txt, 'text-danger');
+        return;
+      }
+      const uploadJson = await uploadResp.json();
+      if (uploadJson.error) {
+        appendLine('Upload error: ' + uploadJson.error, 'text-danger');
+        return;
+      }
+
+      // 2) Start the stream with the saved path from the server
+      await startStream(uploadJson.saved_path);
+
+    } finally {
+      verifyBtn.disabled = false;
+    }
+  });
+})();
+</script>
+{% endblock %}
+{% endblock %}
